@@ -8,7 +8,7 @@ import (
 	"math/big"
 	"sequencer-dequeuer/config"
 	"sequencer-dequeuer/pkgs"
-	"sequencer-dequeuer/pkgs/contract"
+	mycontract "sequencer-dequeuer/pkgs/contract"
 	"sequencer-dequeuer/pkgs/prost"
 	"sequencer-dequeuer/pkgs/redis"
 	"sequencer-dequeuer/pkgs/reporting"
@@ -20,6 +20,7 @@ import (
 	"github.com/cenkalti/backoff/v4"
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/google/uuid"
 	log "github.com/sirupsen/logrus"
 	"google.golang.org/protobuf/encoding/protojson"
@@ -79,7 +80,20 @@ func (s *SubmissionHandler) verifyAndStoreSubmission(details SubmissionDetails) 
 	// TODO: This can be an incorrect submission altogether - check need for reporting
 	if err != nil {
 		log.Errorln("Unable to recover snapshotter address: ", err.Error())
-		return errors.New(fmt.Sprintf("Snapshotter address recovery error: %s", err.Error()))
+		return fmt.Errorf("snapshotter address recovery error: %s", err.Error())
+	}
+
+	// Verify if the snapshotter address is included in the set of flagged accounts in Redis
+	flaggedSnapshotterKey := redis.FlaggedSnapshotterKey()
+	isFlagged, err := redis.RedisClient.SIsMember(context.Background(), flaggedSnapshotterKey, snapshotterAddr.Hex()).Result()
+	if err != nil {
+		log.Errorf("Error querying Redis for flagged snapshotters: %v", err)
+		return fmt.Errorf("redis query error: %s", err.Error())
+	}
+
+	if isFlagged {
+		log.Debugln("Submission from flagged snapshotter: ", snapshotterAddr.Hex())
+		return fmt.Errorf("snapshot submission rejected: snapshotter %s is flagged", snapshotterAddr.Hex())
 	}
 
 	if details.submission.Request.EpochId == 0 {
@@ -98,17 +112,16 @@ func (s *SubmissionHandler) verifyAndStoreSubmission(details SubmissionDetails) 
 
 		if address.Hex() != snapshotterAddr.Hex() {
 			log.Errorln("Incorrect snapshotter address: ", snapshotterAddr.Hex())
-			return errors.New(fmt.Sprintf("Snapshotter address not the one configured in slot: %s", snapshotterAddr.Hex()))
-		} else {
-			//log.Debugf("Snapshotter %s passed validation check!", snapshotterAddr.Hex())
+			return fmt.Errorf("snapshotter address not the one configured in slot: %s", snapshotterAddr.Hex())
 		}
 
 		key := redis.GetSnapshotterSubmissionCountInSlot(snapshotterAddr.Hex(), new(big.Int).SetUint64(details.submission.Request.SlotId))
 		err = redis.RedisClient.Incr(context.Background(), key).Err()
 		if err != nil {
 			log.Errorf("Failed to increment in Redis: %v", err.Error())
-			return errors.New(fmt.Sprintf("Redis client failure: %s", err.Error()))
+			return fmt.Errorf("redis client failure: %s", err.Error())
 		}
+
 		projectData := strings.Split(details.submission.Request.ProjectId, "|")
 		var projectIDFormatted string
 		var nodeVersion string
@@ -127,7 +140,7 @@ func (s *SubmissionHandler) verifyAndStoreSubmission(details SubmissionDetails) 
 		err = redis.RedisClient.Set(context.Background(), key, nodeVersion, 0).Err()
 		if err != nil {
 			log.Errorf("Failed to set node version in Redis: %v", err)
-			return errors.New(fmt.Sprintf("Redis client failure: %s", err.Error()))
+			return fmt.Errorf("redis client failure: %s", err.Error())
 		}
 
 		data := SnapshotData{
@@ -142,13 +155,13 @@ func (s *SubmissionHandler) verifyAndStoreSubmission(details SubmissionDetails) 
 		jsonData, err := json.Marshal(data)
 		if err != nil {
 			log.Errorf("Error serializing data: %v", err)
-			return errors.New(fmt.Sprintf("json marshalling error: %s", err.Error()))
+			return fmt.Errorf("json marshalling error: %s", err.Error())
 		}
 
 		key = redis.GetSnapshotterSlotSubmissionsHtable(snapshotterAddr.Hex(), new(big.Int).SetUint64(details.submission.Request.SlotId))
 		if err := redis.RedisClient.HSet(context.Background(), key, details.submission.Request.EpochId, jsonData).Err(); err != nil {
 			log.Errorf("Failed to write to Redis: %v", err)
-			return errors.New(fmt.Sprintf("Redis client failure: %s", err.Error()))
+			return fmt.Errorf("redis client failure: %s", err.Error())
 		}
 
 		key = fmt.Sprintf("lastPing:%s:%s", snapshotterAddr.Hex(), strconv.Itoa(int(details.submission.Request.SlotId)))
@@ -167,7 +180,7 @@ func (s *SubmissionHandler) verifyAndStoreSubmission(details SubmissionDetails) 
 			log.Errorln("Could not fetch slot info from cache: ", err.Error())
 			return err
 		} else {
-			var slotInfo contract.PowerloomDataMarketSlotInfo
+			var slotInfo mycontract.PowerloomDataMarketSlotInfo
 			err = json.Unmarshal([]byte(slotInfoStr), &slotInfo)
 			if err != nil {
 				log.Errorln("Unable to unmarshal slotInfo: ", slotInfoStr)
@@ -180,7 +193,7 @@ func (s *SubmissionHandler) verifyAndStoreSubmission(details SubmissionDetails) 
 			if snapshotterAddr.Hex() != slotInfo.SnapshotterAddress.Hex() {
 				errMsg = "Incorrect snapshotter address extracted" + string(snapshotterAddr.Hex()) + "for specified slot " + strconv.FormatUint(details.submission.Request.SlotId, 10) + " : " + string(slotInfo.SnapshotterAddress.Hex())
 			} else {
-				currentEpochStr, _ := redis.Get(context.Background(), pkgs.CurrentEpoch)
+				currentEpochStr, err := redis.Get(context.Background(), pkgs.CurrentEpoch)
 				if currentEpochStr == "" {
 					reporting.SendFailureNotification("verifyAndStoreSubmission", fmt.Sprintf("Current epochId not stored in redis: %s", err.Error()), time.Now().String(), "High")
 					log.Errorf("Current epochId not stored in redis: %s", err.Error())
@@ -189,7 +202,7 @@ func (s *SubmissionHandler) verifyAndStoreSubmission(details SubmissionDetails) 
 					if err != nil {
 						reporting.SendFailureNotification("verifyAndStoreSubmission", fmt.Sprintf("Cannot parse epoch %s stored in redis: %s", currentEpochStr, err.Error()), time.Now().String(), "High")
 						log.Errorf("Cannot parse epoch %s stored in redis: %s", currentEpochStr, err.Error())
-					} else if diff := uint64(currentEpoch) - details.submission.Request.EpochId; diff < 0 || diff > 1 {
+					} else if diff := uint64(currentEpoch) - details.submission.Request.EpochId; diff > 1 {
 						errMsg = "Incorrect epochId supplied in request"
 					}
 				}
@@ -200,8 +213,41 @@ func (s *SubmissionHandler) verifyAndStoreSubmission(details SubmissionDetails) 
 			}
 			if errMsg != "" {
 				log.Debugln("Snapshot submission rejected: ", errMsg)
-				return errors.New("Invalid snapshot")
+				return errors.New("invalid snapshot")
 			}
+		}
+
+		// Extract the contract address from the projectID
+		projectData := strings.Split(details.submission.Request.ProjectId, ":")
+
+		// Ensure there are exactly three parts
+		if len(projectData) != 3 {
+			log.Printf("unexpected format for projectID: %s", details.submission.Request.ProjectId)
+		}
+
+		// Get the contract address from the project data
+		expectedContractAddr := projectData[1]
+
+		// Retrieve the initial pairs from the configuration settings
+		initialPairs := config.SettingsObj.InitialPairs
+
+		pairContractIndex, err := fetchPairContractIndex(
+			int64(details.submission.Request.EpochId),
+			int64(details.submission.Request.SlotId),
+			int64(len(initialPairs)),
+			snapshotterAddr,
+		)
+		if err != nil {
+			reporting.SendFailureNotification("verifyAndStoreSubmission", fmt.Sprint("Failed to fetch pair contract index: ", err.Error()), time.Now().String(), "High")
+			log.Error("Failed to fetch pair contract index: ", err.Error())
+		}
+
+		// Retrieve the contract address corresponding to the calculated pair contract index
+		fetchedContractAddr := initialPairs[pairContractIndex]
+
+		if expectedContractAddr != fetchedContractAddr {
+			log.Errorln("Mismatched pair contract index: ", err.Error())
+			return errors.New("failed to verify pair contract index")
 		}
 	}
 
@@ -272,6 +318,48 @@ func (s *SubmissionHandler) verifyAndStoreSubmission(details SubmissionDetails) 
 		}
 	}
 	return nil
+}
+
+func getSnapshotterHash(snapshotAddr common.Address) *big.Int {
+	// Convert the address into a lower case string
+	snapshotterAddrString := strings.ToLower(snapshotAddr.String())
+
+	// Convert the hexadecimal string to an integer (base 16)
+	intVal := new(big.Int)
+	intVal.SetString(snapshotterAddrString[2:], 16)
+
+	// Calculate snapshotter hash using Keccak256 algorithm
+	snapshotterHash := crypto.Keccak256(intVal.Bytes())
+
+	// Convert snapshotterHash (byte slice) to big.Int
+	snapshotterHashBigInt := new(big.Int).SetBytes(snapshotterHash)
+
+	return snapshotterHashBigInt
+}
+
+func fetchPairContractIndex(epochID, slotID, size int64, snapshotterAddr common.Address) (int64, error) {
+	// Calculate snapshotter hash
+	snapshotterHash := getSnapshotterHash(snapshotterAddr)
+
+	// Fetch current day
+	currentDay, err := prost.FetchCurrentDay()
+	if err != nil {
+		return 0, err
+	}
+
+	// Initialize a total variable for the calculation
+	calculationSum := new(big.Int)
+
+	// Perform the addition
+	calculationSum.
+		Add(big.NewInt(epochID), snapshotterHash). // Add epochID and snapshotterHash
+		Add(calculationSum, big.NewInt(slotID)).   // Add slotID to the result
+		Add(calculationSum, currentDay)            // Add currentDay to the result
+
+	// Calculate contract index based on the size of initial pairs
+	calculatedPairIndex := new(big.Int).Mod(calculationSum, big.NewInt(size)).Int64()
+
+	return calculatedPairIndex, nil
 }
 
 func (s *SubmissionHandler) startSubmissionDequeuer() {

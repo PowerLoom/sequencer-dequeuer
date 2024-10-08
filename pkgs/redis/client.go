@@ -146,8 +146,6 @@ func ResetCollectorDBSubmissions(ctx context.Context, epochID *big.Int, headers 
 
 			// Optionally, delete the set itself to clean up
 			RedisClient.Del(ctx, setKey)
-		} else {
-			//log.Debugln("No keys found to delete.")
 		}
 	}
 }
